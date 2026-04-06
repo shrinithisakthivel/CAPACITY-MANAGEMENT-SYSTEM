@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 import path from "path";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
+import bcrypt from "bcrypt";
 
 dotenv.config();
 
@@ -135,9 +136,9 @@ const occupy = (type: string, count: number) => {
   }
 };
 
-// occupy('Normal', 15);
-// occupy('ICU', 3);
-// occupy('Emergency', 2);
+occupy('Normal', 15);
+occupy('ICU', 3);
+occupy('Emergency', 2);
 
 let isDemoMode = false;
 
@@ -146,12 +147,13 @@ async function seedData() {
   if (isDemoMode) return;
   try {
     // Ensure the specific admin exists with the correct password
+    const hashedPassword = await bcrypt.hash("shri123", 10);
     await Staff.findOneAndUpdate(
       { username: "admin@gmail.com" },
-      { password: "shri123" },
+      { password: hashedPassword },
       { upsert: true, new: true }
     );
-    console.log("Admin user seeded/verified");
+    console.log("Admin user seeded/verified with secure password");
 
     const bedCount = await Bed.countDocuments();
     if (bedCount === 0) {
@@ -191,7 +193,11 @@ async function startServer() {
       if (isDemoMode) {
         user = demoStaff.find(u => u.username === username && u.password === password);
       } else {
-        user = await Staff.findOne({ username, password });
+        user = await Staff.findOne({ username });
+        if (user) {
+          const isMatch = await bcrypt.compare(password, user.password);
+          if (!isMatch) user = null;
+        }
       }
 
       if (user) {
@@ -322,18 +328,13 @@ async function startServer() {
       return res.json({ success: true, bedId: bed.id });
     }
 
-    const session = await mongoose.startSession();
-    session.startTransaction();
     try {
-      const bed = await Bed.findOne({ type: bedType, status: 'Available' }).session(session);
+      const bed = await Bed.findOne({ type: bedType, status: 'Available' });
       
       if (!bed) {
-        await session.abortTransaction();
-        session.endSession();
         return res.json({ success: false, message: `No available ${bedType} beds.` });
       }
-
-      await Patient.create([{
+      await Patient.create({
         name, age, gender, contact, nationality: nationality || 'Indian', bed_id: bed.id, doctor, reason,
         admission_date: admission_date ? new Date(admission_date) : new Date(),
         amount_paid: amountPaid || 0,
@@ -341,18 +342,15 @@ async function startServer() {
         total_fees: 0,
         expected_days: expectedDays || 1,
         status: 'Admitted'
-      }], { session });
+      });
 
       bed.status = 'Occupied';
-      await bed.save({ session });
+      await bed.save();
 
-      await session.commitTransaction();
-      session.endSession();
       res.json({ success: true, bedId: bed.id });
-    } catch (error) {
-      await session.abortTransaction();
-      session.endSession();
-      res.status(500).json({ success: false, message: "Admission failed" });
+    } catch (error: any) {
+      console.error("Admission error:", error);
+      res.status(500).json({ success: false, message: `Admission failed: ${error.message}` });
     }
   });
 
@@ -370,7 +368,7 @@ async function startServer() {
     
     const patientsWithBedType = patients.map(p => {
       const bed = beds.find(b => b.id === p.bed_id);
-      return { ...p, bed_type: bed ? bed.type : 'Unknown' };
+      return { ...p, id: p._id.toString(), bed_type: bed ? bed.type : 'Unknown' };
     });
     
     res.json(patientsWithBedType);
@@ -379,8 +377,8 @@ async function startServer() {
   // Patient History
   app.get("/api/history", async (req, res) => {
     if (isDemoMode) return res.json(demoHistory);
-    const history = await History.find().sort({ discharge_date: -1 });
-    res.json(history);
+    const history = await History.find().sort({ discharge_date: -1 }).lean();
+    res.json(history.map(h => ({ ...h, id: h._id.toString() })));
   });
 
   // Record payment for patient
@@ -456,9 +454,10 @@ async function startServer() {
   // Patient Discharge
   app.post("/api/discharge", async (req, res) => {
     const { patientId, bedId, amount_paid, amount_due } = req.body;
+    console.log(`Discharge request for Patient ID: ${patientId}, Bed ID: ${bedId}`);
     
     if (isDemoMode) {
-      const patientIndex = demoPatients.findIndex(p => p.id === patientId);
+      const patientIndex = demoPatients.findIndex(p => p.id === patientId || p._id === patientId);
       if (patientIndex !== -1) {
         const patient = demoPatients[patientIndex];
         
@@ -491,54 +490,62 @@ async function startServer() {
           return res.json({ success: true, status: 'Discharged' });
         }
       }
-      return res.status(404).json({ success: false, message: 'Patient not found' });
+      return res.status(404).json({ success: false, message: 'Patient not found in demo data' });
     }
 
-    const session = await mongoose.startSession();
-    session.startTransaction();
     try {
-      const patient = await Patient.findById(patientId).session(session);
-      if (!patient) throw new Error("Patient not found");
+      // Validate patientId
+      if (!mongoose.Types.ObjectId.isValid(patientId)) {
+        console.error(`Invalid Patient ID format: ${patientId}`);
+        return res.status(400).json({ success: false, message: 'Invalid Patient ID format' });
+      }
+
+      const patient = await Patient.findById(patientId);
+      if (!patient) {
+        console.error(`Patient not found in database: ${patientId}`);
+        return res.status(404).json({ success: false, message: 'Patient not found' });
+      }
 
       patient.amount_paid = amount_paid;
       patient.amount_due = amount_due;
 
-      // Always free the bed during discharge
-      if (bedId) {
-        const bed = await Bed.findOne({ id: bedId }).session(session);
-        if (bed) {
-          bed.status = 'Available';
-          await bed.save({ session });
-        }
+      // Find the bed once
+      const bed = bedId ? await Bed.findOne({ id: bedId }) : null;
+      if (bed) {
+        bed.status = 'Available';
+        await bed.save();
       }
 
       if (amount_due > 0) {
         patient.status = 'Payment Pending';
-        await patient.save({ session });
-        await session.commitTransaction();
-        session.endSession();
+        await patient.save();
         return res.json({ success: true, status: 'Payment Pending' });
       } else {
-        const bed = await Bed.findOne({ id: bedId }).session(session);
-        if (bed) {
-          await History.create([{
-            name: patient.name, age: patient.age, gender: patient.gender, contact: patient.contact,
-            nationality: patient.nationality, admission_date: patient.admission_date,
-            bed_id: bed.id, bed_type: bed.type, doctor: patient.doctor, reason: patient.reason,
-            amount_paid: patient.amount_paid, amount_due: patient.amount_due,
-            total_fees: patient.total_fees || 0
-          }], { session });
+        // Move to history
+        await History.create({
+          name: patient.name, 
+          age: patient.age, 
+          gender: patient.gender, 
+          contact: patient.contact,
+          nationality: patient.nationality, 
+          admission_date: patient.admission_date,
+          discharge_date: new Date(),
+          bed_id: bedId, 
+          bed_type: bed ? bed.type : 'Unknown', 
+          doctor: patient.doctor, 
+          reason: patient.reason,
+          amount_paid: amount_paid, 
+          amount_due: amount_due,
+          total_fees: patient.total_fees || 0
+        });
 
-          await Patient.findByIdAndDelete(patientId).session(session);
-        }
-        await session.commitTransaction();
-        session.endSession();
+        await Patient.findByIdAndDelete(patientId);
+        
         return res.json({ success: true, status: 'Discharged' });
       }
-    } catch (error) {
-      await session.abortTransaction();
-      session.endSession();
-      res.status(500).json({ success: false, message: "Discharge failed" });
+    } catch (error: any) {
+      console.error("Discharge error:", error);
+      res.status(500).json({ success: false, message: `Discharge failed: ${error.message}` });
     }
   });
 
